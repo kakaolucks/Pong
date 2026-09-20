@@ -206,7 +206,7 @@ The host acts as both:
 * The game server
 * A local game client
 
-The client receives authoritative state from the host instead of independently simulating the complete game state.
+The client receives authoritative state from the host rather than independently simulating the full game state.
 
 ## Building
 
@@ -247,4 +247,6 @@ This project is designed to look and feel like a classic console-style applicati
 
 It is therefore a **Win32 GUI application, not a Windows console application**.
 
-The console-style interface is part of the game's visual design rather than its underlying application subsystem.
+The console-style interface is part of the game's visual design, not its underlying application subsystem.
+
+The AI handled all the coding.
