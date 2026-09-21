@@ -575,22 +575,26 @@ static void hostWorker(int port) {
                                     auto base = already ? (lastHitBy == 1 ? hostRevUntil : clientRevUntil) : now;
                                     if (lastHitBy == 1) hostRevUntil = base + std::chrono::seconds(ITEM_REVERSE_SECONDS);
                                     else clientRevUntil = base + std::chrono::seconds(ITEM_REVERSE_SECONDS);
-                                    // Only (re)start the freeze/ease animation if the ball isn't
-                                    // already mid-sequence from an earlier reverse pickup -
-                                    // otherwise it would keep re-freezing the ball forever.
-                                    if (ballSeqKind != 1) {
+                                    // Only freeze the ball on the FIRST pickup (effect was not
+                                    // active yet). Picking up another one while it's still
+                                    // active just extends the duration above - it must never
+                                    // re-freeze the ball, even if the earlier freeze/ease has
+                                    // already fully finished.
+                                    if (!already) {
                                         ballSeqKind = 1; ballSeqAffected = lastHitBy; ballSeqStart = now;
                                     }
                                     // real velocity is left untouched; freeze/ramp only affects
                                     // whether/how much it's applied to position (see above)
                                 }
                                 break;
-                            case ITEM_ROTATE:
-                                rotateUntil = (rotActive ? rotateUntil : now) + std::chrono::seconds(ITEM_ROTATE_SECONDS);
-                                if (ballSeqKind != 2) {
+                            case ITEM_ROTATE: {
+                                bool already = rotActive;
+                                rotateUntil = (already ? rotateUntil : now) + std::chrono::seconds(ITEM_ROTATE_SECONDS);
+                                if (!already) {
                                     ballSeqKind = 2; ballSeqAffected = 0; ballSeqStart = now;
                                 }
                                 break;
+                            }
                             case ITEM_REWIND: {
                                 if (ballSeqKind == 3) {
                                     // already mid rewind-freeze/ease; don't stop the ball again
