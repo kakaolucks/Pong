@@ -259,6 +259,7 @@ struct RenderState {
     int   ballSeqKind = 0;
     int   ballSeqAffected = 0;
     float ballSeqElapsed = 0;
+    bool  isCpuMode = false;
 };
 static RenderState g_render;
 
@@ -328,6 +329,7 @@ static void hostWorker(int port) {
     {
         std::lock_guard<std::mutex> lk(g_render.mtx);
         g_render.isHost = true;
+        g_render.isCpuMode = false;
         g_render.status = "You are the LEFT paddle (host).";
         g_render.phase = 0;
     }
@@ -748,6 +750,337 @@ static void hostWorker(int port) {
     g_workerFinished = true;
 }
 
+static void cpuWorker() {
+    {
+        std::lock_guard<std::mutex> lk(g_render.mtx);
+        g_render.isHost = true;
+        g_render.isCpuMode = true;
+        g_render.status = "You are the LEFT paddle. Playing against the CPU.";
+        g_render.phase = 1;
+    }
+    g_matchStarted = true;
+
+    std::mt19937 rng{ std::random_device{}() };
+    auto randRange = [&](float lo, float hi) { std::uniform_real_distribution<float> d(lo, hi); return d(rng); };
+    auto randItemType = [&]() -> uint8_t { std::uniform_int_distribution<int> d(1, 6); return (uint8_t)d(rng); };
+
+    bool keepGoing = true;
+    while (keepGoing && !g_abortMatch) {
+        // ---- reset round state ----
+        {
+            std::lock_guard<std::mutex> lk(g_render.mtx);
+            g_render.ballX = FIELD_W / 2.0f; g_render.ballY = FIELD_H / 2.0f;
+            g_render.p1Y = FIELD_H / 2.0f - PADDLE_H / 2.0f;
+            g_render.p2Y = g_render.p1Y;
+            g_render.score1 = 0; g_render.score2 = 0;
+            g_render.gameOver = false;
+            g_render.phase = 1;
+        }
+
+        float ballVX = BALL_SPD_INIT, ballVY = BALL_SPD_INIT * 0.6f;
+        bool over = false;
+        auto matchStart = std::chrono::steady_clock::now();
+
+        bool itemActive = false;
+        uint8_t itemType = 0;
+        float itemX = 0, itemY = 0;
+        auto itemNextSpawn = matchStart + std::chrono::milliseconds((int)(randRange(ITEM_SPAWN_MIN_SEC, ITEM_SPAWN_MAX_SEC) * 1000));
+        int lastHitBy = 0; // 0=none, 1=host(you), 2=client(CPU)
+
+        auto hostFastUntil = matchStart, clientFastUntil = matchStart;
+        auto hostRevUntil = matchStart, clientRevUntil = matchStart;
+        auto rotateUntil = matchStart;
+        auto ballBoostUntil = matchStart;
+        bool prevRotActive = false;
+        auto lastTickTime = matchStart;
+
+        int ballSeqKind = 0;
+        int ballSeqAffected = 0;
+        std::chrono::steady_clock::time_point ballSeqStart = matchStart;
+
+        struct Snap { float t, bx, by, bvx, bvy, p1, p2; int s1, s2; };
+        std::deque<Snap> history;
+
+        float cpuTargetY = FIELD_H / 2.0f - PADDLE_H / 2.0f;
+        float cpuVelY = 0.0f; // the CPU paddle's own smoothed velocity, for human-like acceleration
+
+        // ---- gameplay loop ----
+        while (!over && !g_abortMatch) {
+            auto now = std::chrono::steady_clock::now();
+            float elapsedSec = std::chrono::duration<float>(now - matchStart).count();
+            if (elapsedSec < 0) elapsedSec = 0;
+            if (elapsedSec > (float)MATCH_SECONDS) elapsedSec = (float)MATCH_SECONDS;
+            float timeScale = 1.0f + (SPEED_MAX_MULT - 1.0f) * (elapsedSec / (float)MATCH_SECONDS);
+
+            bool hostFast = now < hostFastUntil;
+            bool clientFast = now < clientFastUntil;
+            bool hostRevActive = now < hostRevUntil;
+            bool clientRevActive = now < clientRevUntil;
+            bool rotActive = now < rotateUntil;
+            bool boostActive = now < ballBoostUntil;
+
+            auto secsLeftOf = [&](std::chrono::steady_clock::time_point until, bool active) -> int {
+                if (!active) return 0;
+                int v = (int)std::ceil(std::chrono::duration<float>(until - now).count());
+                if (v < 0) v = 0;
+                return v;
+                };
+            int hostFastSec = secsLeftOf(hostFastUntil, hostFast);
+            int clientFastSec = secsLeftOf(clientFastUntil, clientFast);
+            int hostRevSec = secsLeftOf(hostRevUntil, hostRevActive);
+            int clientRevSec = secsLeftOf(clientRevUntil, clientRevActive);
+            int rotSec = secsLeftOf(rotateUntil, rotActive);
+            if (rotSec > ITEM_ROTATE_SECONDS) rotSec = ITEM_ROTATE_SECONDS;
+
+            if (prevRotActive && !rotActive && ballSeqKind == 0) {
+                ballSeqKind = 2; ballSeqAffected = 0; ballSeqStart = now;
+            }
+            prevRotActive = rotActive;
+
+            if (ballSeqKind != 0) {
+                float dt = std::chrono::duration<float>(now - lastTickTime).count();
+                if (dt < 0) dt = 0;
+                if (dt > 0.25f) dt = 0.25f;
+                auto shift = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<float>(dt));
+                if (hostRevActive)   hostRevUntil += shift;
+                if (clientRevActive) clientRevUntil += shift;
+                if (hostFast)        hostFastUntil += shift;
+                if (clientFast)      clientFastUntil += shift;
+                if (rotActive)       rotateUntil += shift;
+                if (boostActive)     ballBoostUntil += shift;
+            }
+            lastTickTime = now;
+
+            float speedMult = timeScale * (boostActive ? ITEM_SPEEDUP_MULT : 1.0f);
+
+            int rawDir = (g_keyDown ? 1 : 0) - (g_keyUp ? 1 : 0);
+            int myDir = hostRevActive ? -rawDir : rawDir;
+            float p1Spd = PADDLE_SPD * (hostFast ? ITEM_PADDLESPEED_MULT : 1.0f);
+
+            // ---- CPU AI: only actively track the ball while it's heading this way
+            // (bvx > 0). Predict where it will cross the paddle's plane, including
+            // any wall bounces along the way, and always aim for that spot - even if
+            // there isn't time to fully get there. Movement is smoothed (its own
+            // velocity eases toward a target speed) instead of snapping to full
+            // speed every tick, for a more human, less jerky feel. ----
+            {
+                float curBallX, curBallY;
+                { std::lock_guard<std::mutex> lk(g_render.mtx); curBallX = g_render.ballX; curBallY = g_render.ballY; }
+                float effVX = ballVX * speedMult, effVY = ballVY * speedMult;
+                if (effVX > 0.0001f) {
+                    float dx = (FIELD_W - PADDLE_ZONE) - curBallX;
+                    if (dx < 0) dx = 0;
+                    float t = dx / effVX;
+                    float rawY = curBallY + effVY * t;
+                    float loY = BALL_WALL_MARGIN, hiY = (float)FIELD_H - BALL_WALL_MARGIN;
+                    float range = hiY - loY;
+                    float period = 2.0f * range;
+                    float rel = rawY - loY;
+                    float m = std::fmod(rel, period);
+                    if (m < 0) m += period;
+                    float folded = (m > range) ? (period - m) : m;
+                    float landingY = loY + folded;
+                    cpuTargetY = landingY - PADDLE_H / 2.0f;
+                    if (cpuTargetY < 0) cpuTargetY = 0;
+                    if (cpuTargetY > FIELD_H - PADDLE_H) cpuTargetY = (float)(FIELD_H - PADDLE_H);
+                }
+            }
+            bool ballComingAtCpu = ballVX > 0.0001f;
+            float p2MaxSpeed = PADDLE_SPD * 1.15f * (clientFast ? ITEM_PADDLESPEED_MULT : 1.0f);
+            float p2MaxAccel = p2MaxSpeed * 0.30f;
+
+            bool ballLive = true;
+            float seqRampMult = 1.0f;
+            float seqElapsedOut = 0;
+            if (ballSeqKind != 0) {
+                float seqElapsed = std::chrono::duration<float>(now - ballSeqStart).count();
+                seqElapsedOut = seqElapsed;
+                if (seqElapsed < BALL_FREEZE_SECONDS) {
+                    ballLive = false;
+                }
+                else {
+                    float p2 = (seqElapsed - BALL_FREEZE_SECONDS) / BALL_EASE_SECONDS;
+                    bool finishing = (p2 >= 1.0f);
+                    if (finishing) p2 = 1.0f;
+                    seqRampMult = easeInOut(p2);
+                    if (finishing) ballSeqKind = 0;
+                }
+            }
+
+            float bx, by, p1, p2; int s1, s2; int secLeft;
+            bool justScored = false;
+            {
+                std::lock_guard<std::mutex> lk(g_render.mtx);
+                g_render.p1Y += myDir * p1Spd;
+                clampPaddle(g_render.p1Y);
+
+                // Smoothed pursuit: ease this tick's velocity toward a desired speed
+                // (proportional to distance from the target, capped) instead of
+                // jumping straight to max speed - much less jittery to watch.
+                float desiredVel = 0.0f;
+                if (ballComingAtCpu) {
+                    float diff = cpuTargetY - g_render.p2Y;
+                    desiredVel = diff * 0.3f;
+                    if (desiredVel > p2MaxSpeed) desiredVel = p2MaxSpeed;
+                    if (desiredVel < -p2MaxSpeed) desiredVel = -p2MaxSpeed;
+                }
+                float dv = desiredVel - cpuVelY;
+                if (dv > p2MaxAccel) dv = p2MaxAccel;
+                if (dv < -p2MaxAccel) dv = -p2MaxAccel;
+                cpuVelY += dv;
+                g_render.p2Y += cpuVelY;
+                clampPaddle(g_render.p2Y);
+
+                if (ballLive) {
+                    float prevBallX = g_render.ballX;
+                    g_render.ballX += ballVX * speedMult * seqRampMult;
+                    g_render.ballY += ballVY * speedMult * seqRampMult;
+                    if (g_render.ballY <= BALL_WALL_MARGIN || g_render.ballY >= FIELD_H - BALL_WALL_MARGIN) ballVY = -ballVY;
+
+                    if (ballVX < 0 && prevBallX > PADDLE_ZONE && g_render.ballX <= PADDLE_ZONE &&
+                        g_render.ballY >= g_render.p1Y - 1 && g_render.ballY <= g_render.p1Y + PADDLE_H) {
+                        ballVX = -ballVX * HIT_SPEEDUP; ballVY *= HIT_SPEEDUP;
+                        clampBallSpeed(ballVX, ballVY);
+                        g_render.ballX = PADDLE_ZONE; lastHitBy = 1;
+                    }
+                    if (ballVX > 0 && prevBallX < FIELD_W - PADDLE_ZONE && g_render.ballX >= FIELD_W - PADDLE_ZONE &&
+                        g_render.ballY >= g_render.p2Y - 1 && g_render.ballY <= g_render.p2Y + PADDLE_H) {
+                        ballVX = -ballVX * HIT_SPEEDUP; ballVY *= HIT_SPEEDUP;
+                        clampBallSpeed(ballVX, ballVY);
+                        g_render.ballX = FIELD_W - PADDLE_ZONE; lastHitBy = 2;
+                    }
+
+                    if (itemActive) {
+                        float dx = g_render.ballX - itemX, dy = g_render.ballY - itemY;
+                        if (dx * dx + dy * dy <= ITEM_PICKUP_DIST * ITEM_PICKUP_DIST) {
+                            switch (itemType) {
+                            case ITEM_SPEEDUP:
+                                ballBoostUntil = now + std::chrono::seconds(ITEM_SPEEDUP_SECONDS);
+                                break;
+                            case ITEM_BOUNCE:
+                                ballVX = -ballVX;
+                                break;
+                            case ITEM_PADDLESPEED:
+                                if (lastHitBy == 1) hostFastUntil = now + std::chrono::seconds(ITEM_PADDLESPEED_SECONDS);
+                                else if (lastHitBy == 2) clientFastUntil = now + std::chrono::seconds(ITEM_PADDLESPEED_SECONDS);
+                                break;
+                            case ITEM_REVERSE:
+                                if (lastHitBy == 1 || lastHitBy == 2) {
+                                    bool already = (lastHitBy == 1) ? hostRevActive : clientRevActive;
+                                    auto base = already ? (lastHitBy == 1 ? hostRevUntil : clientRevUntil) : now;
+                                    if (lastHitBy == 1) hostRevUntil = base + std::chrono::seconds(ITEM_REVERSE_SECONDS);
+                                    else clientRevUntil = base + std::chrono::seconds(ITEM_REVERSE_SECONDS);
+                                    if (!already) {
+                                        ballSeqKind = 1; ballSeqAffected = lastHitBy; ballSeqStart = now;
+                                    }
+                                }
+                                break;
+                            case ITEM_ROTATE: {
+                                bool already = rotActive;
+                                rotateUntil = (already ? rotateUntil : now) + std::chrono::seconds(ITEM_ROTATE_SECONDS);
+                                if (!already) {
+                                    ballSeqKind = 2; ballSeqAffected = 0; ballSeqStart = now;
+                                }
+                                break;
+                            }
+                            case ITEM_REWIND: {
+                                if (ballSeqKind == 3) break;
+                                float target = elapsedSec - (float)ITEM_REWIND_SECONDS;
+                                const Snap* pick = nullptr;
+                                for (auto& sN : history) { if (sN.t <= target) pick = &sN; else break; }
+                                ballSeqKind = 3; ballSeqAffected = 0; ballSeqStart = now;
+                                if (pick) {
+                                    g_render.ballX = pick->bx; g_render.ballY = pick->by;
+                                    g_render.p1Y = pick->p1; g_render.p2Y = pick->p2;
+                                    g_render.score1 = pick->s1; g_render.score2 = pick->s2;
+                                    ballVX = pick->bvx; ballVY = pick->bvy;
+                                    clampBallSpeed(ballVX, ballVY);
+                                    matchStart = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<float>(pick->t));
+                                }
+                                break;
+                            }
+                            default: break;
+                            }
+                            itemActive = false;
+                            itemNextSpawn = now + std::chrono::milliseconds((int)(randRange(ITEM_SPAWN_MIN_SEC, ITEM_SPAWN_MAX_SEC) * 1000));
+                        }
+                    }
+
+                    if (g_render.ballX < 0) {
+                        g_render.score2++; justScored = true;
+                        g_render.ballX = FIELD_W / 2.0f; g_render.ballY = FIELD_H / 2.0f;
+                        ballVX = BALL_SPD_INIT; ballVY = BALL_SPD_INIT * 0.6f; lastHitBy = 0;
+                        ballSeqKind = 0;
+                    }
+                    else if (g_render.ballX > FIELD_W) {
+                        g_render.score1++; justScored = true;
+                        g_render.ballX = FIELD_W / 2.0f; g_render.ballY = FIELD_H / 2.0f;
+                        ballVX = -BALL_SPD_INIT; ballVY = BALL_SPD_INIT * 0.6f; lastHitBy = 0;
+                        ballSeqKind = 0;
+                    }
+                }
+
+                if (!itemActive && now >= itemNextSpawn) {
+                    itemActive = true;
+                    itemType = randItemType();
+                    itemX = randRange(10.0f, (float)FIELD_W - 10.0f);
+                    itemY = randRange(2.0f, (float)FIELD_H - 2.0f);
+                }
+
+                secLeft = MATCH_SECONDS - (int)elapsedSec;
+                if (secLeft < 0) secLeft = 0;
+                g_render.secondsLeft = secLeft;
+
+                if (g_render.score1 >= WIN_SCORE || g_render.score2 >= WIN_SCORE || elapsedSec >= (float)MATCH_SECONDS) {
+                    g_render.gameOver = true; over = true;
+                }
+
+                g_render.itemActive = itemActive ? 1 : 0;
+                g_render.itemType = itemType; g_render.itemX = itemX; g_render.itemY = itemY;
+                g_render.hostFastLeft = hostFastSec; g_render.clientFastLeft = clientFastSec;
+                g_render.hostRevLeft = hostRevSec; g_render.clientRevLeft = clientRevSec;
+                g_render.rotateLeft = rotSec;
+                g_render.ballSeqKind = ballSeqKind; g_render.ballSeqAffected = ballSeqAffected;
+                g_render.ballSeqElapsed = (ballSeqKind != 0) ? seqElapsedOut : 0;
+
+                bx = g_render.ballX; by = g_render.ballY; p1 = g_render.p1Y; p2 = g_render.p2Y;
+                s1 = g_render.score1; s2 = g_render.score2;
+            }
+            (void)justScored; // no point-break pause in CPU mode - the rally just continues
+
+            history.push_back(Snap{ elapsedSec, bx, by, ballVX, ballVY, p1, p2, s1, s2 });
+            while (!history.empty() && history.front().t < elapsedSec - 7.0f) history.pop_front();
+
+            auto elapsedT = std::chrono::steady_clock::now() - now;
+            auto sleepMs = TICK_MS - std::chrono::duration_cast<std::chrono::milliseconds>(elapsedT).count();
+            if (sleepMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+        }
+
+        if (g_abortMatch) { keepGoing = false; break; }
+
+        // ---- post-game: single player, just wait for ENTER (restart) or ESC (menu) ----
+        {
+            std::lock_guard<std::mutex> lk(g_render.mtx);
+            g_render.phase = 2;
+            g_render.rematchVotes = 0;
+            g_render.itemActive = 0;
+            g_render.hostFastLeft = 0; g_render.clientFastLeft = 0;
+            g_render.hostRevLeft = 0; g_render.clientRevLeft = 0;
+            g_render.ballBoostLeft = 0; g_render.rotateLeft = 0;
+            g_render.ballSeqKind = 0;
+        }
+        g_localRematchVote = 0;
+        bool restarting = false;
+        while (!g_abortMatch) {
+            if (g_localRematchVote.load() == 1) { restarting = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
+        }
+        keepGoing = restarting && !g_abortMatch;
+    }
+
+    g_workerFinished = true;
+}
+
 static void joinWorker(std::string ip, int port) {
     g_matchStarted = false;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -800,6 +1133,7 @@ static void joinWorker(std::string ip, int port) {
     {
         std::lock_guard<std::mutex> lk(g_render.mtx);
         g_render.isHost = false;
+        g_render.isCpuMode = false;
         g_render.status = "You are the RIGHT paddle.";
         g_render.phase = 0;
     }
@@ -856,7 +1190,7 @@ static void joinWorker(std::string ip, int port) {
 
 // ---------------- Text-mode screens (menu / input / status) ----------------
 struct BtnRect { int row = -1, colStart = 0, colEnd = 0; };
-static BtnRect g_hostBtn, g_joinBtn, g_quitBtn;
+static BtnRect g_hostBtn, g_joinBtn, g_cpuBtn, g_quitBtn;
 
 static std::vector<std::string> buildMenuLines() {
     std::vector<std::string> L;
@@ -866,6 +1200,7 @@ static std::vector<std::string> buildMenuLines() {
     L.push_back("");
     L.push_back(" No dedicated server needed - one player HOSTs the game,");
     L.push_back(" the other player JOINs using the host's IP and port.");
+    L.push_back(" Or just play solo against the CPU.");
     L.push_back("");
 
     int row = (int)L.size();
@@ -874,13 +1209,15 @@ static std::vector<std::string> buildMenuLines() {
         r.row = row; r.colStart = (int)btnLine.size(); btnLine += text; r.colEnd = (int)btnLine.size();
         };
     addBtn("[ 1: HOST ]", g_hostBtn);
-    btnLine += "      ";
+    btnLine += "   ";
     addBtn("[ 2: JOIN ]", g_joinBtn);
-    btnLine += "      ";
-    addBtn("[ 3: QUIT ]", g_quitBtn);
+    btnLine += "   ";
+    addBtn("[ 3: CPU ]", g_cpuBtn);
+    btnLine += "   ";
+    addBtn("[ 4: QUIT ]", g_quitBtn);
     L.push_back(btnLine);
     L.push_back("");
-    L.push_back(" Click a button above, or press 1 / 2 / 3 on your keyboard.");
+    L.push_back(" Click a button above, or press 1 / 2 / 3 / 4 on your keyboard.");
     return L;
 }
 static std::vector<std::string> buildHostPortInputLines() {
@@ -1002,6 +1339,7 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
     int itemActive, itemType; float itemX, itemY;
     int hostFastLeft, clientFastLeft, hostRevLeft, clientRevLeft, rotateLeft, ballBoostLeft;
     int ballSeqKind, ballSeqAffected; float ballSeqElapsed;
+    bool isCpuMode;
     std::string status;
     {
         std::lock_guard<std::mutex> lk(g_render.mtx);
@@ -1017,6 +1355,7 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
         rotateLeft = g_render.rotateLeft; ballBoostLeft = g_render.ballBoostLeft;
         ballSeqKind = g_render.ballSeqKind; ballSeqAffected = g_render.ballSeqAffected;
         ballSeqElapsed = g_render.ballSeqElapsed;
+        isCpuMode = g_render.isCpuMode;
     }
 
     HFONT oldFont = (HFONT)SelectObject(memDC, font);
@@ -1070,19 +1409,23 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
     // Paddle rects: the edge that faces the field center sits exactly on the
     // PADDLE_ZONE collision plane (converted through the same scale factors used
     // for the ball), so what you see always matches where the ball actually bounces.
+    // Your own paddle is drawn in a bright accent color so it's always obvious
+    // which one you're moving; the opponent's stays plain white.
+    HBRUSH myBrush = CreateSolidBrush(RGB(70, 220, 255));
     int p1FrontL = GAME_ORIGIN_X + (int)(PADDLE_ZONE * SCALE_X);
     RECT p1L{ p1FrontL - PADDLE_PX_W, GAME_ORIGIN_Y + (int)(p1 * SCALE_Y), p1FrontL, GAME_ORIGIN_Y + (int)((p1 + PADDLE_H) * SCALE_Y) };
     int p1FrontP = GAME_ORIGIN_Y_P + (int)(PADDLE_ZONE * SCALE_X_P);
     RECT p1P{ GAME_ORIGIN_X_P + (int)(p1 * SCALE_Y_P), p1FrontP - PADDLE_PX_W, GAME_ORIGIN_X_P + (int)((p1 + PADDLE_H) * SCALE_Y_P), p1FrontP };
     RECT p1R = lerpRect(p1L, p1P, morphT);
-    FillRect(memDC, &p1R, whiteBrush);
+    FillRect(memDC, &p1R, isHost ? myBrush : whiteBrush);
 
     int p2FrontL = GAME_ORIGIN_X + (int)((FIELD_W - PADDLE_ZONE) * SCALE_X);
     RECT p2L{ p2FrontL, GAME_ORIGIN_Y + (int)(p2 * SCALE_Y), p2FrontL + PADDLE_PX_W, GAME_ORIGIN_Y + (int)((p2 + PADDLE_H) * SCALE_Y) };
     int p2FrontP = GAME_ORIGIN_Y_P + (int)((FIELD_W - PADDLE_ZONE) * SCALE_X_P);
     RECT p2P{ GAME_ORIGIN_X_P + (int)(p2 * SCALE_Y_P), p2FrontP, GAME_ORIGIN_X_P + (int)((p2 + PADDLE_H) * SCALE_Y_P), p2FrontP + PADDLE_PX_W };
     RECT p2R = lerpRect(p2L, p2P, morphT);
-    FillRect(memDC, &p2R, whiteBrush);
+    FillRect(memDC, &p2R, isHost ? whiteBrush : myBrush);
+    DeleteObject(myBrush);
 
     if (phase == 1) {
         int bcx, bcy; mapPt(bx, by, bcx, bcy);
@@ -1146,12 +1489,17 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
         bool iWin = isHost ? (s1 > s2) : (s2 > s1);
         const char* msg = tie ? "*** TIME'S UP - TIE GAME ***" : (iWin ? "*** YOU WIN! ***" : "*** YOU LOSE! ***");
         TextOutA(memDC, 16, textY, msg, (int)strlen(msg));
-        bool localVoted = (g_localRematchVote.load() == 1);
         char line2[128];
-        if (localVoted)
-            snprintf(line2, sizeof(line2), "Play again? (%d/2) - waiting for opponent... %ds left", votes, secondsLeft);
-        else
-            snprintf(line2, sizeof(line2), "Play again? (%d/2) - press ENTER   %ds left", votes, secondsLeft);
+        if (isCpuMode) {
+            snprintf(line2, sizeof(line2), "Press ENTER to play again      [ESC] Back to menu");
+        }
+        else {
+            bool localVoted = (g_localRematchVote.load() == 1);
+            if (localVoted)
+                snprintf(line2, sizeof(line2), "Play again? (%d/2) - waiting for opponent... %ds left", votes, secondsLeft);
+            else
+                snprintf(line2, sizeof(line2), "Play again? (%d/2) - press ENTER   %ds left", votes, secondsLeft);
+        }
         TextOutA(memDC, 16, textY + lineH, line2, (int)strlen(line2));
     }
     else if (phase == 3) {
@@ -1167,7 +1515,9 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
         TextOutA(memDC, 16, textY + lineH, line2b, (int)strlen(line2b));
     }
     else {
-        const char* msg2 = "Move: W/S, Up/Down, A/D or Left/Right      [ESC] Quit match";
+        char msg2[96];
+        if (isCpuMode) snprintf(msg2, sizeof(msg2), "Move: W/S, Up/Down, A/D or Left/Right   vs CPU   [ESC] Quit");
+        else snprintf(msg2, sizeof(msg2), "Move: W/S, Up/Down, A/D or Left/Right      [ESC] Quit match");
         TextOutA(memDC, 16, textY, msg2, (int)strlen(msg2));
         int myFast = isHost ? hostFastLeft : clientFastLeft;
         int myRev = isHost ? hostRevLeft : clientRevLeft;
@@ -1218,6 +1568,15 @@ static void startJoinMatch(const std::string& ip, int port) {
     g_workerThread = std::thread(joinWorker, ip, port);
     g_state = AppState::JOIN_CONNECTING;
 }
+static void startCpuMatch() {
+    g_workerFinished = false; g_matchStarted = false;
+    g_cancelRequested = false; g_abortMatch = false; g_errorMsg.clear();
+    g_localRematchVote = 0;
+    if (g_workerThread.joinable()) g_workerThread.join();
+    g_workerThread = std::thread(cpuWorker);
+    g_state = AppState::PLAYING; // no waiting/lobby needed for a local CPU match
+}
+
 
 static bool isAllowedInputChar(AppState st, char c) {
     if (st == AppState::HOST_INPUT_PORT || st == AppState::JOIN_INPUT_PORT) return isdigit((unsigned char)c) != 0;
@@ -1343,6 +1702,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             int row = (y - PAD_Y) / g_charH;
             if (row == g_hostBtn.row && col >= g_hostBtn.colStart && col < g_hostBtn.colEnd) goToHostInput();
             else if (row == g_joinBtn.row && col >= g_joinBtn.colStart && col < g_joinBtn.colEnd) goToJoinInput();
+            else if (row == g_cpuBtn.row && col >= g_cpuBtn.colStart && col < g_cpuBtn.colEnd) startCpuMatch();
             else if (row == g_quitBtn.row && col >= g_quitBtn.colStart && col < g_quitBtn.colEnd) DestroyWindow(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
@@ -1358,7 +1718,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else if (g_state == AppState::MENU) {
             if (wParam == '1') goToHostInput();
             else if (wParam == '2') goToJoinInput();
-            else if (wParam == '3') DestroyWindow(hwnd);
+            else if (wParam == '3') startCpuMatch();
+            else if (wParam == '4') DestroyWindow(hwnd);
         }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
