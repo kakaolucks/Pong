@@ -74,7 +74,7 @@ static const float PADDLE_ZONE = 2.0f; // field units from the edge where a padd
 static const float BALL_WALL_MARGIN = 0.3f; // field units of margin for the top/bottom wall bounce
 static const float PADDLE_SPD = 0.45f;
 static const float BALL_SPD_INIT = 0.3f;
-static const int   WIN_SCORE = 11;
+static const int   WIN_SCORE = 10;
 static const int   TICK_MS = 16;   // ~60 fps / ticks per second, for smooth motion
 static const int   MATCH_SECONDS = 300;  // 5-minute match
 static const float SPEED_MAX_MULT = 3.0f; // ball is up to 3x faster by the end of the match
@@ -354,12 +354,16 @@ static void hostWorker(int port) {
             st.ballX = g_render.ballX; st.ballY = g_render.ballY;
             st.p1Y = g_render.p1Y; st.p2Y = g_render.p2Y;
             st.score1 = g_render.score1; st.score2 = g_render.score2;
+            // Forward the real ongoing attribute timers (rotate especially) so the
+            // client's layout doesn't snap back to landscape during a vote screen
+            // just because this packet type used to hardcode them to zero.
+            st.hostFastLeft = (uint8_t)g_render.hostFastLeft; st.clientFastLeft = (uint8_t)g_render.clientFastLeft;
+            st.hostRevLeft = (uint8_t)g_render.hostRevLeft; st.clientRevLeft = (uint8_t)g_render.clientRevLeft;
+            st.ballBoostLeft = (uint8_t)g_render.ballBoostLeft; st.rotateLeft = (uint8_t)g_render.rotateLeft;
         }
         st.phase = phase; st.hostVote = (uint8_t)hostVote; st.clientVote = (uint8_t)clientVote;
         st.secondsLeft = secLeft; st.restarting = (uint8_t)(restarting ? 1 : 0);
         st.itemActive = 0; st.itemType = 0; st.itemX = 0; st.itemY = 0;
-        st.hostFastLeft = 0; st.clientFastLeft = 0; st.hostRevLeft = 0; st.clientRevLeft = 0;
-        st.ballBoostLeft = 0; st.rotateLeft = 0;
         st.ballSeqKind = 0; st.ballSeqAffected = 0; st.ballSeqElapsed = 0;
         return sendStruct(client, &st, sizeof(st));
         };
@@ -567,18 +571,31 @@ static void hostWorker(int port) {
                                 break;
                             case ITEM_REVERSE:
                                 if (lastHitBy == 1 || lastHitBy == 2) {
-                                    if (lastHitBy == 1) hostRevUntil = now + std::chrono::seconds(ITEM_REVERSE_SECONDS);
-                                    else clientRevUntil = now + std::chrono::seconds(ITEM_REVERSE_SECONDS);
-                                    ballSeqKind = 1; ballSeqAffected = lastHitBy; ballSeqStart = now;
+                                    bool already = (lastHitBy == 1) ? hostRevActive : clientRevActive;
+                                    auto base = already ? (lastHitBy == 1 ? hostRevUntil : clientRevUntil) : now;
+                                    if (lastHitBy == 1) hostRevUntil = base + std::chrono::seconds(ITEM_REVERSE_SECONDS);
+                                    else clientRevUntil = base + std::chrono::seconds(ITEM_REVERSE_SECONDS);
+                                    // Only (re)start the freeze/ease animation if the ball isn't
+                                    // already mid-sequence from an earlier reverse pickup -
+                                    // otherwise it would keep re-freezing the ball forever.
+                                    if (ballSeqKind != 1) {
+                                        ballSeqKind = 1; ballSeqAffected = lastHitBy; ballSeqStart = now;
+                                    }
                                     // real velocity is left untouched; freeze/ramp only affects
                                     // whether/how much it's applied to position (see above)
                                 }
                                 break;
                             case ITEM_ROTATE:
-                                rotateUntil = now + std::chrono::seconds(ITEM_ROTATE_SECONDS);
-                                ballSeqKind = 2; ballSeqAffected = 0; ballSeqStart = now;
+                                rotateUntil = (rotActive ? rotateUntil : now) + std::chrono::seconds(ITEM_ROTATE_SECONDS);
+                                if (ballSeqKind != 2) {
+                                    ballSeqKind = 2; ballSeqAffected = 0; ballSeqStart = now;
+                                }
                                 break;
                             case ITEM_REWIND: {
+                                if (ballSeqKind == 3) {
+                                    // already mid rewind-freeze/ease; don't stop the ball again
+                                    break;
+                                }
                                 float target = elapsedSec - (float)ITEM_REWIND_SECONDS;
                                 const Snap* pick = nullptr;
                                 for (auto& sN : history) { if (sN.t <= target) pick = &sN; else break; }
@@ -1024,7 +1041,14 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
     else {
         snprintf(scoreBuf, sizeof(scoreBuf), "SCORE  %d : %d", s1, s2);
     }
-    TextOutA(memDC, 24, 20, scoreBuf, (int)strlen(scoreBuf));
+    {
+        SIZE sz; GetTextExtentPoint32A(memDC, scoreBuf, (int)strlen(scoreBuf), &sz);
+        int scoreX = ox + gw / 2 - sz.cx / 2;
+        int scoreY = oy - sz.cy - 14; // just above the field, centered over it
+        if (scoreX < 8) scoreX = 8;
+        if (scoreY < 8) scoreY = 8;
+        TextOutA(memDC, scoreX, scoreY, scoreBuf, (int)strlen(scoreBuf));
+    }
 
     RECT field{ ox, oy, ox + gw, oy + gh };
     FrameRect(memDC, &field, whiteBrush);
