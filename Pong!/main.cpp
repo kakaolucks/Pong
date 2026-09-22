@@ -756,13 +756,30 @@ static void cpuWorker() {
         g_render.isHost = true;
         g_render.isCpuMode = true;
         g_render.status = "You are the LEFT paddle. Playing against the CPU.";
-        g_render.phase = 1;
+        g_render.phase = 0;
     }
     g_matchStarted = true;
 
     std::mt19937 rng{ std::random_device{}() };
     auto randRange = [&](float lo, float hi) { std::uniform_real_distribution<float> d(lo, hi); return d(rng); };
     auto randItemType = [&]() -> uint8_t { std::uniform_int_distribution<int> d(1, 6); return (uint8_t)d(rng); };
+
+    // The CPU always "votes" ready instantly, so these waits are really just
+    // waiting for the human to press ENTER - but shown with the exact same
+    // Ready?/Play again? (x/2) screens used in multiplayer.
+    auto waitForReady = [&](uint8_t phase) -> bool {
+        { std::lock_guard<std::mutex> lk(g_render.mtx); g_render.phase = phase; g_render.rematchVotes = 0; }
+        g_localRematchVote = 0;
+        while (!g_abortMatch) {
+            int hostReady = g_localRematchVote.load();
+            { std::lock_guard<std::mutex> lk(g_render.mtx); g_render.rematchVotes = hostReady + 1; }
+            if (hostReady) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
+        }
+        return false;
+        };
+
+    if (!waitForReady(0)) { g_workerFinished = true; return; }
 
     bool keepGoing = true;
     while (keepGoing && !g_abortMatch) {
@@ -1046,7 +1063,12 @@ static void cpuWorker() {
                 bx = g_render.ballX; by = g_render.ballY; p1 = g_render.p1Y; p2 = g_render.p2Y;
                 s1 = g_render.score1; s2 = g_render.score2;
             }
-            (void)justScored; // no point-break pause in CPU mode - the rally just continues
+            if (justScored && !over) {
+                // ---- point break: same "Next point: ready?" pause as multiplayer;
+                // the CPU auto-votes ready, so this just waits for ENTER ----
+                if (!waitForReady(3)) break;
+                { std::lock_guard<std::mutex> lk(g_render.mtx); g_render.phase = 1; }
+            }
 
             history.push_back(Snap{ elapsedSec, bx, by, ballVX, ballVY, p1, p2, s1, s2 });
             while (!history.empty() && history.front().t < elapsedSec - 7.0f) history.pop_front();
@@ -1058,24 +1080,17 @@ static void cpuWorker() {
 
         if (g_abortMatch) { keepGoing = false; break; }
 
-        // ---- post-game: single player, just wait for ENTER (restart) or ESC (menu) ----
+        // ---- post-game: same "Play again? (x/2)" screen as multiplayer; the CPU
+        // auto-votes ready, so this just waits for ENTER ----
         {
             std::lock_guard<std::mutex> lk(g_render.mtx);
-            g_render.phase = 2;
-            g_render.rematchVotes = 0;
             g_render.itemActive = 0;
             g_render.hostFastLeft = 0; g_render.clientFastLeft = 0;
             g_render.hostRevLeft = 0; g_render.clientRevLeft = 0;
             g_render.ballBoostLeft = 0; g_render.rotateLeft = 0;
             g_render.ballSeqKind = 0;
         }
-        g_localRematchVote = 0;
-        bool restarting = false;
-        while (!g_abortMatch) {
-            if (g_localRematchVote.load() == 1) { restarting = true; break; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
-        }
-        keepGoing = restarting && !g_abortMatch;
+        keepGoing = waitForReady(2) && !g_abortMatch;
     }
 
     g_workerFinished = true;
@@ -1490,11 +1505,12 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
         const char* msg = tie ? "*** TIME'S UP - TIE GAME ***" : (iWin ? "*** YOU WIN! ***" : "*** YOU LOSE! ***");
         TextOutA(memDC, 16, textY, msg, (int)strlen(msg));
         char line2[128];
+        bool localVoted = (g_localRematchVote.load() == 1);
         if (isCpuMode) {
-            snprintf(line2, sizeof(line2), "Press ENTER to play again      [ESC] Back to menu");
+            if (localVoted) snprintf(line2, sizeof(line2), "Play again? (%d/2)", votes);
+            else snprintf(line2, sizeof(line2), "Play again? (%d/2) - press ENTER      [ESC] Back to menu", votes);
         }
         else {
-            bool localVoted = (g_localRematchVote.load() == 1);
             if (localVoted)
                 snprintf(line2, sizeof(line2), "Play again? (%d/2) - waiting for opponent... %ds left", votes, secondsLeft);
             else
