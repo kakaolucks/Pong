@@ -73,9 +73,10 @@ static const int   PADDLE_H = 4;
 static const float PADDLE_ZONE = 2.0f; // field units from the edge where a paddle's front face sits (used for BOTH collision and drawing, so they always match)
 static const float BALL_WALL_MARGIN = 0.3f; // field units of margin for the top/bottom wall bounce
 static const float PADDLE_SPD = 0.45f;
+static const float TICK_STEP_SCALE = 0.5f; // 8 ms tick vs original 16 ms: preserve exact movement speed
 static const float BALL_SPD_INIT = 0.3f;
 static const int   WIN_SCORE = 10;
-static const int   TICK_MS = 16;   // ~60 fps / ticks per second, for smooth motion
+static const int   TICK_MS = 8;    // 125 Hz simulation/network tick
 static const int   MATCH_SECONDS = 300;  // 5-minute match
 static const float SPEED_MAX_MULT = 3.0f; // ball is up to 3x faster by the end of the match
 static const float HIT_SPEEDUP = 1.03f;
@@ -528,15 +529,15 @@ static void hostWorker(int port) {
             bool justScored = false;
             {
                 std::lock_guard<std::mutex> lk(g_render.mtx);
-                g_render.p1Y += myDir * p1Spd;
-                g_render.p2Y += peerDir * p2Spd;
+                g_render.p1Y += myDir * p1Spd * TICK_STEP_SCALE;
+                g_render.p2Y += peerDir * p2Spd * TICK_STEP_SCALE;
                 clampPaddle(g_render.p1Y);
                 clampPaddle(g_render.p2Y);
 
                 if (ballLive) {
                     float prevBallX = g_render.ballX;
-                    g_render.ballX += ballVX * speedMult * seqRampMult;
-                    g_render.ballY += ballVY * speedMult * seqRampMult;
+                    g_render.ballX += ballVX * speedMult * seqRampMult * TICK_STEP_SCALE;
+                    g_render.ballY += ballVY * speedMult * seqRampMult * TICK_STEP_SCALE;
                     if (g_render.ballY <= BALL_WALL_MARGIN || g_render.ballY >= FIELD_H - BALL_WALL_MARGIN) ballVY = -ballVY;
 
                     // Swept (crossing) collision so a fast ball can never skip over a
@@ -820,6 +821,7 @@ static void cpuWorker() {
 
         float cpuTargetY = FIELD_H / 2.0f - PADDLE_H / 2.0f;
         float cpuVelY = 0.0f; // the CPU paddle's own smoothed velocity, for human-like acceleration
+        float lastKnownBallX = FIELD_W / 2.0f, lastKnownBallY = FIELD_H / 2.0f;
 
         // ---- gameplay loop ----
         while (!over && !g_abortMatch) {
@@ -879,16 +881,15 @@ static void cpuWorker() {
             // any wall bounces along the way, and always aim for that spot - even if
             // there isn't time to fully get there. Movement is smoothed (its own
             // velocity eases toward a target speed) instead of snapping to full
-            // speed every tick, for a more human, less jerky feel. ----
+            // speed every tick, for a more human, less jerky feel. Uses last tick's
+            // known ball position (one tick old, negligible) to avoid an extra lock. ----
             {
-                float curBallX, curBallY;
-                { std::lock_guard<std::mutex> lk(g_render.mtx); curBallX = g_render.ballX; curBallY = g_render.ballY; }
-                float effVX = ballVX * speedMult, effVY = ballVY * speedMult;
+                float effVX = ballVX * speedMult * TICK_STEP_SCALE, effVY = ballVY * speedMult * TICK_STEP_SCALE;
                 if (effVX > 0.0001f) {
-                    float dx = (FIELD_W - PADDLE_ZONE) - curBallX;
+                    float dx = (FIELD_W - PADDLE_ZONE) - lastKnownBallX;
                     if (dx < 0) dx = 0;
                     float t = dx / effVX;
-                    float rawY = curBallY + effVY * t;
+                    float rawY = lastKnownBallY + effVY * t;
                     float loY = BALL_WALL_MARGIN, hiY = (float)FIELD_H - BALL_WALL_MARGIN;
                     float range = hiY - loY;
                     float period = 2.0f * range;
@@ -903,7 +904,7 @@ static void cpuWorker() {
                 }
             }
             bool ballComingAtCpu = ballVX > 0.0001f;
-            float p2MaxSpeed = PADDLE_SPD * 1.15f * (clientFast ? ITEM_PADDLESPEED_MULT : 1.0f);
+            float p2MaxSpeed = PADDLE_SPD * 1.15f * (clientFast ? ITEM_PADDLESPEED_MULT : 1.0f) * TICK_STEP_SCALE;
             float p2MaxAccel = p2MaxSpeed * 0.30f;
 
             bool ballLive = true;
@@ -928,7 +929,7 @@ static void cpuWorker() {
             bool justScored = false;
             {
                 std::lock_guard<std::mutex> lk(g_render.mtx);
-                g_render.p1Y += myDir * p1Spd;
+                g_render.p1Y += myDir * p1Spd * TICK_STEP_SCALE;
                 clampPaddle(g_render.p1Y);
 
                 // Smoothed pursuit: ease this tick's velocity toward a desired speed
@@ -950,8 +951,8 @@ static void cpuWorker() {
 
                 if (ballLive) {
                     float prevBallX = g_render.ballX;
-                    g_render.ballX += ballVX * speedMult * seqRampMult;
-                    g_render.ballY += ballVY * speedMult * seqRampMult;
+                    g_render.ballX += ballVX * speedMult * seqRampMult * TICK_STEP_SCALE;
+                    g_render.ballY += ballVY * speedMult * seqRampMult * TICK_STEP_SCALE;
                     if (g_render.ballY <= BALL_WALL_MARGIN || g_render.ballY >= FIELD_H - BALL_WALL_MARGIN) ballVY = -ballVY;
 
                     if (ballVX < 0 && prevBallX > PADDLE_ZONE && g_render.ballX <= PADDLE_ZONE &&
@@ -1063,6 +1064,7 @@ static void cpuWorker() {
                 bx = g_render.ballX; by = g_render.ballY; p1 = g_render.p1Y; p2 = g_render.p2Y;
                 s1 = g_render.score1; s2 = g_render.score2;
             }
+            lastKnownBallX = bx; lastKnownBallY = by;
             if (justScored && !over) {
                 // ---- point break: same "Next point: ready?" pause as multiplayer;
                 // the CPU auto-votes ready, so this just waits for ENTER ----
@@ -1377,7 +1379,7 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, RGB(255, 255, 255));
     HBRUSH whiteBrush = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    HBRUSH itemBrush = CreateSolidBrush(RGB(255, 210, 60));
+    static HBRUSH itemBrush = CreateSolidBrush(RGB(255, 210, 60));
 
     int ox = GAME_ORIGIN_X + (int)((GAME_ORIGIN_X_P - GAME_ORIGIN_X) * morphT);
     int oy = GAME_ORIGIN_Y + (int)((GAME_ORIGIN_Y_P - GAME_ORIGIN_Y) * morphT);
@@ -1426,7 +1428,7 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
     // for the ball), so what you see always matches where the ball actually bounces.
     // Your own paddle is drawn in a bright accent color so it's always obvious
     // which one you're moving; the opponent's stays plain white.
-    HBRUSH myBrush = CreateSolidBrush(RGB(70, 220, 255));
+    static HBRUSH myBrush = CreateSolidBrush(RGB(70, 220, 255));
     int p1FrontL = GAME_ORIGIN_X + (int)(PADDLE_ZONE * SCALE_X);
     RECT p1L{ p1FrontL - PADDLE_PX_W, GAME_ORIGIN_Y + (int)(p1 * SCALE_Y), p1FrontL, GAME_ORIGIN_Y + (int)((p1 + PADDLE_H) * SCALE_Y) };
     int p1FrontP = GAME_ORIGIN_Y_P + (int)(PADDLE_ZONE * SCALE_X_P);
@@ -1440,10 +1442,10 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
     RECT p2P{ GAME_ORIGIN_X_P + (int)(p2 * SCALE_Y_P), p2FrontP, GAME_ORIGIN_X_P + (int)((p2 + PADDLE_H) * SCALE_Y_P), p2FrontP + PADDLE_PX_W };
     RECT p2R = lerpRect(p2L, p2P, morphT);
     FillRect(memDC, &p2R, isHost ? whiteBrush : myBrush);
-    DeleteObject(myBrush);
 
     if (phase == 1) {
         int bcx, bcy; mapPt(bx, by, bcx, bcy);
+
         RECT ballR{ bcx - BALL_PX / 2, bcy - BALL_PX / 2, bcx + BALL_PX / 2, bcy + BALL_PX / 2 };
         FillRect(memDC, &ballR, whiteBrush);
 
@@ -1482,9 +1484,8 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
                 int tx = ox + gw / 2 - sz.cx / 2;
                 int ty = oy + gh / 2 - sz.cy / 2;
                 RECT bg{ tx - 14, ty - 8, tx + sz.cx + 14, ty + sz.cy + 8 };
-                HBRUSH warnBrush = CreateSolidBrush(RGB(200, 40, 40));
+                static HBRUSH warnBrush = CreateSolidBrush(RGB(200, 40, 40));
                 FillRect(memDC, &bg, warnBrush);
-                DeleteObject(warnBrush);
                 TextOutA(memDC, tx, ty, msg, (int)strlen(msg));
             }
         }
@@ -1545,7 +1546,6 @@ static void drawGameScreen(HDC memDC, HFONT font, int lineH, float morphT) {
         if (effLen > 0) TextOutA(memDC, 16, textY + lineH, eff, effLen);
     }
 
-    DeleteObject(itemBrush);
     SelectObject(memDC, oldFont);
 }
 
@@ -1651,14 +1651,32 @@ static RECT computeContentRect() {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
-        SetTimer(hwnd, ID_TIMER, TICK_MS, nullptr);
+        // Render at the same 8 ms cadence as the simulation/network tick.
+        // No motion blur or render interpolation is used.
+        SetTimer(hwnd, ID_TIMER, 8, nullptr);
         return 0;
 
     case WM_TIMER: {
         if (g_state == AppState::PLAYING) {
             int rotSecs;
-            { std::lock_guard<std::mutex> lk(g_render.mtx); rotSecs = g_render.rotateLeft; }
-            bool wantPortrait = rotSecs > 0;
+            int phase;
+            {
+                std::lock_guard<std::mutex> lk(g_render.mtx);
+                rotSecs = g_render.rotateLeft;
+                phase = g_render.phase;
+            }
+
+            // Rotation is a temporary in-match effect. Never carry the portrait
+            // layout into the lobby/post-game screen or into a fresh round.
+            // This also clears stale local morph state after a rematch.
+            if (phase == 0 || phase == 2) {
+                g_rotSettled = false;
+                g_rotMorphing = false;
+                g_rotMorphTarget = false;
+                g_rotMorphT = 0.0f;
+            }
+
+            bool wantPortrait = (phase == 1 || phase == 3) && rotSecs > 0;
             if (!g_rotMorphing && wantPortrait != g_rotSettled) {
                 g_rotMorphing = true;
                 g_rotMorphTarget = wantPortrait;
@@ -1707,6 +1725,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         default: break;
         }
+        // The timer is render-only. The simulation still uses the original 16 ms
+        // tick, while the renderer samples it more frequently and interpolates
+        // between simulation states.
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -1807,63 +1828,68 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
 
-        // Reuse one off-screen buffer for the whole app's lifetime instead of
-        // creating/destroying a full-screen bitmap every frame (was a source of lag).
         static HDC memDC = nullptr;
-        static HBITMAP bmp = nullptr;
+        static HBITMAP memBitmap = nullptr;
+        static HBITMAP oldBitmap = nullptr;
         static int bufW = 0, bufH = 0;
-        static RECT prevContentRect{ 0, 0, 0, 0 };
+
         if (!memDC || bufW != rc.right || bufH != rc.bottom) {
-            if (bmp) DeleteObject(bmp);
-            if (memDC) DeleteDC(memDC);
-            memDC = CreateCompatibleDC(hdc);
-            bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            SelectObject(memDC, bmp);
-            bufW = rc.right; bufH = rc.bottom;
-            HBRUSH allBlack = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(memDC, &rc, allBlack);
-            DeleteObject(allBlack);
-            prevContentRect = RECT{ 0, 0, 0, 0 };
-            // Paint the whole screen black right away - otherwise only our small
-            // content rect ever gets blitted and whatever was on screen before
-            // (desktop, previous window, etc.) stays visible around it.
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            if (memDC) {
+                if (oldBitmap) {
+                    SelectObject(memDC, oldBitmap);
+                    oldBitmap = nullptr;
+                }
+                DeleteDC(memDC);
+                memDC = nullptr;
+            }
+            if (memBitmap) {
+                DeleteObject(memBitmap);
+                memBitmap = nullptr;
+            }
+            bufW = bufH = 0;
+
+            if (rc.right > 0 && rc.bottom > 0) {
+                memDC = CreateCompatibleDC(hdc);
+                if (memDC) {
+                    memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+                    if (memBitmap) {
+                        oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+                        bufW = rc.right;
+                        bufH = rc.bottom;
+                    }
+                    else {
+                        DeleteDC(memDC);
+                        memDC = nullptr;
+                    }
+                }
+            }
         }
 
-        // Only clear/redraw/blit the small region content actually occupies (plus
-        // the previous frame's region, so switching screens never leaves stale
-        // pixels behind) instead of the entire fullscreen buffer every frame.
-        RECT content = computeContentRect();
-        RECT clearRect = content;
-        if (prevContentRect.right > prevContentRect.left) {
-            if (prevContentRect.left < clearRect.left) clearRect.left = prevContentRect.left;
-            if (prevContentRect.top < clearRect.top) clearRect.top = prevContentRect.top;
-            if (prevContentRect.right > clearRect.right) clearRect.right = prevContentRect.right;
-            if (prevContentRect.bottom > clearRect.bottom) clearRect.bottom = prevContentRect.bottom;
-        }
-        prevContentRect = content;
+        if (memDC && memBitmap) {
+            FillRect(memDC, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-        HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(memDC, &clearRect, blackBrush);
-        DeleteObject(blackBrush);
-
-        if (g_state == AppState::PLAYING) {
-            drawGameScreen(memDC, g_font, g_charH, g_rotMorphT);
-        }
-        else {
-            HFONT oldFont = (HFONT)SelectObject(memDC, g_font);
-            SetBkMode(memDC, TRANSPARENT);
-            SetTextColor(memDC, RGB(60, 230, 100)); // retro terminal green
-
-            auto lines = buildFrameLines();
-            for (size_t i = 0; i < lines.size(); i++) {
-                TextOutA(memDC, PAD_X, PAD_Y + (int)i * g_charH, lines[i].c_str(), (int)lines[i].size());
+            if (g_state == AppState::PLAYING) {
+                drawGameScreen(memDC, g_font, g_charH, g_rotMorphT);
+            }
+            else {
+                HFONT oldFont = (HFONT)SelectObject(memDC, g_font);
+                SetBkMode(memDC, TRANSPARENT);
+                SetTextColor(memDC, RGB(255, 255, 255));
+                auto lines = buildFrameLines();
+                int y = PAD_Y;
+                for (const auto& line : lines) {
+                    TextOutA(memDC, PAD_X, y, line.c_str(), (int)line.size());
+                    y += g_charH;
+                }
+                SelectObject(memDC, oldFont);
             }
 
-            SelectObject(memDC, oldFont);
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
         }
-        BitBlt(hdc, clearRect.left, clearRect.top, clearRect.right - clearRect.left, clearRect.bottom - clearRect.top,
-            memDC, clearRect.left, clearRect.top, SRCCOPY);
+        else {
+            FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        }
+
         EndPaint(hwnd, &ps);
         return 0;
     }
